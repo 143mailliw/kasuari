@@ -24,7 +24,16 @@ pub enum InternalSolverError {
     FailedToFindLeavingRow,
     #[error("Edit constraint not in system")]
     EditConstraintNotInSystem,
+    #[error("The solver pivoted too many times without reaching an optimum.")]
+    TooManyPivots,
 }
+
+/// The most pivots a single optimization may take before giving up.
+///
+/// Pivots are chosen by Bland's rule, which rules out cycling in exact arithmetic, so this is only
+/// a backstop against floating point error turning a degenerate system into an endless loop. Real
+/// systems settle in far fewer pivots than this.
+const MAX_PIVOTS: usize = 100_000;
 
 #[derive(Copy, Clone)]
 struct Tag {
@@ -590,9 +599,10 @@ impl Solver {
     /// Optimize the system for the given objective function.
     ///
     /// This method performs iterations of Phase 2 of the simplex method
-    /// until the objective function reaches a minimum.
+    /// until the objective function reaches a minimum, or gives up after
+    /// `MAX_PIVOTS` pivots.
     fn optimize(&mut self, target: OptimizeTarget) -> Result<(), InternalSolverError> {
-        loop {
+        for _ in 0..MAX_PIVOTS {
             let entering = {
                 let objective = match target {
                     OptimizeTarget::Objective => &self.objective,
@@ -615,6 +625,7 @@ impl Solver {
             }
             self.rows.insert(entering, row);
         }
+        Err(InternalSolverError::TooManyPivots)
     }
 
     /// Optimize the system using the dual of the simplex method.
@@ -622,8 +633,9 @@ impl Solver {
     /// The current state of the system should be such that the objective
     /// function is optimal, but not feasible. This method will perform
     /// an iteration of the dual simplex method to make the solution both
-    /// optimal and feasible.
+    /// optimal and feasible. It gives up after `MAX_PIVOTS` pivots.
     fn dual_optimize(&mut self) -> Result<(), InternalSolverError> {
+        let mut pivots = 0;
         while let Some(leaving) = self.infeasible_rows.pop() {
             let row = if let Entry::Occupied(entry) = self.rows.entry(leaving) {
                 if entry.get().constant < 0.0 {
@@ -635,6 +647,10 @@ impl Solver {
                 None
             };
             if let Some(mut row) = row {
+                pivots += 1;
+                if pivots > MAX_PIVOTS {
+                    return Err(InternalSolverError::TooManyPivots);
+                }
                 let entering = self.get_dual_entering_symbol(&row);
                 if entering.kind() == SymbolKind::Invalid {
                     return Err(InternalSolverError::DualOptimizeFailed);
@@ -654,18 +670,21 @@ impl Solver {
 
     /// Compute the entering variable for a pivot operation.
     ///
-    /// This method will return first symbol in the objective function which
-    /// is non-dummy and has a coefficient less than zero. If no symbol meets
-    /// the criteria, it means the objective function is at a minimum, and an
-    /// invalid symbol is returned.
+    /// This method will return the lowest symbol in the objective function
+    /// which is non-dummy and has a coefficient less than zero. Taking the
+    /// lowest rather than whichever comes first in the map is Bland's rule,
+    /// which keeps the simplex method from cycling through degenerate pivots
+    /// forever. If no symbol meets the criteria, it means the objective
+    /// function is at a minimum, and an invalid symbol is returned.
     /// Could return an External symbol
     fn get_entering_symbol(objective: &Row) -> Symbol {
-        for (symbol, value) in &objective.cells {
-            if symbol.kind() != SymbolKind::Dummy && *value < 0.0 {
-                return *symbol;
-            }
-        }
-        Symbol::invalid()
+        objective
+            .cells
+            .iter()
+            .filter(|(symbol, value)| symbol.kind() != SymbolKind::Dummy && **value < 0.0)
+            .map(|(symbol, _)| *symbol)
+            .min()
+            .unwrap_or_else(Symbol::invalid)
     }
 
     /// Compute the entering symbol for the dual optimize operation.
@@ -674,7 +693,7 @@ impl Solver {
     /// coefficient and yields the minimum ratio for its respective symbol
     /// in the objective function. The provided row *must* be infeasible.
     /// If no symbol is found which meats the criteria, an invalid symbol
-    /// is returned.
+    /// is returned. Ties go to the lowest symbol, as in Bland's rule.
     /// Could return an External symbol
     fn get_dual_entering_symbol(&self, row: &Row) -> Symbol {
         let mut entering = Symbol::invalid();
@@ -683,7 +702,8 @@ impl Solver {
             if *value > 0.0 && symbol.kind() != SymbolKind::Dummy {
                 let coeff = self.objective.coefficient_for(*symbol);
                 let r = coeff / *value;
-                if r < ratio {
+                let lower = entering.kind() == SymbolKind::Invalid || *symbol < entering;
+                if r < ratio || (r == ratio && lower) {
                     ratio = r;
                     entering = *symbol;
                 }
@@ -710,17 +730,19 @@ impl Solver {
     /// This method will return an iterator to the row in the row map
     /// which holds the exit symbol. If no appropriate exit symbol is
     /// found, the end() iterator will be returned. This indicates that
-    /// the objective function is unbounded.
+    /// the objective function is unbounded. Ties go to the lowest symbol,
+    /// as in Bland's rule.
     /// Never returns a row for an External symbol
     fn get_leaving_row(&mut self, entering: Symbol) -> Option<(Symbol, Box<Row>)> {
         let mut ratio = f64::INFINITY;
-        let mut found = None;
+        let mut found: Option<Symbol> = None;
         for (symbol, row) in &self.rows {
             if symbol.kind() != SymbolKind::External {
                 let temp = row.coefficient_for(entering);
                 if temp < 0.0 {
                     let temp_ratio = -row.constant / temp;
-                    if temp_ratio < ratio {
+                    let lower = found.is_none_or(|found| *symbol < found);
+                    if temp_ratio < ratio || (temp_ratio == ratio && lower) {
                         ratio = temp_ratio;
                         found = Some(*symbol);
                     }
